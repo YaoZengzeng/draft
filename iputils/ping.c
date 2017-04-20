@@ -42,6 +42,7 @@ char *hostname;
 int datalen = DEFDATALEN;
 
 int main(int argc, char **argv) {
+	struct hostent *hp;
 	int packlen;
 	char *target;
 	char *packet;
@@ -65,8 +66,13 @@ int main(int argc, char **argv) {
 	if (inet_aton(target, &whereto.sin_addr) == 1){
 		hostname = target;
 	} else {
-		fprintf(stderr, "ping: inet_aton %s failed\n", target);
-		return 1;
+		hp = gethostbyname(target);
+		if (!hp) {
+			fprintf(stderr, "ping: unkown host %s\n", target);
+			return 1;
+		}
+		memcpy(&whereto.sin_addr, hp->h_addr, 4);
+		hostname = hp->h_name;
 	}
 
 	packlen = datalen + MAXIPLEN + MAXICMPLEN;
