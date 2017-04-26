@@ -1,0 +1,5 @@
+#!/bin/sh
+module="scull"
+
+sudo /sbin/rmmod ./$module.ko
+
