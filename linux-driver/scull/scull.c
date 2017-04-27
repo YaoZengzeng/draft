@@ -5,6 +5,7 @@
 #include <linux/types.h>
 #include <linux/fs.h>		/* everything...*/
 #include <linux/cdev.h>
+#include <linux/proc_fs.h>
 #include <linux/slab.h>		/* kmalloc() */
 #include <linux/fcntl.h>	/* O_ACCMODE */
 #include <asm/uaccess.h>	/* copy_*_user */
@@ -238,6 +239,33 @@ static void scull_setup_cdev(struct scull_dev *dev, int index) {
 	}
 }
 
+// The proc filesystem: function to read and entry
+int scull_read_procmem(char *buf, char **start, off_t offset,
+			int count, int *eof, void *data) {
+	int i, len = 0;
+
+	for (i = 0; i < SCULL_NR_DEVS; i++) {
+		struct scull_dev *d = &scull_devices[i];
+		
+		len += sprintf(buf + len, "\nDevice %i: qset %i, q %i, sz %li\n", i, d->qset, d->quantum, d->size);
+	}
+	*eof = 1;
+
+	return len;
+}
+
+// Acutally create (and remove) the /proc file(s)
+static void scull_create_proc(void) {
+	create_proc_read_entry("scullmem", 0 /* default mode */,
+				NULL /* parent dir */, scull_read_procmem,
+				NULL /* client data */);
+}
+
+static void scull_remove_proc(void) {
+	// No problem if it was not registered
+	remove_proc_entry("scullmem", NULL /* Parent dir */);
+}
+
 int scull_init_module(void) {
 	int result, i;
 	dev_t dev = 0;
@@ -262,6 +290,9 @@ int scull_init_module(void) {
 		scull_devices[i].qset = scull_qset;
 		scull_setup_cdev(&scull_devices[i], i);
 	}
+	
+	scull_create_proc();
+
 	printk("scull: module init succeed\n");
 	return 0; /* succeed */
 
