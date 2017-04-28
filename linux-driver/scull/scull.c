@@ -8,6 +8,7 @@
 #include <linux/proc_fs.h>
 #include <linux/slab.h>		/* kmalloc() */
 #include <linux/fcntl.h>	/* O_ACCMODE */
+#include <linux/seq_file.h>
 #include <asm/uaccess.h>	/* copy_*_user */
 
 MODULE_LICENSE("GPL");
@@ -254,16 +255,88 @@ int scull_read_procmem(char *buf, char **start, off_t offset,
 	return len;
 }
 
+// Here are our sequence iteration methods. Our "postion" is
+// simply the device number
+static void *scull_seq_start(struct seq_file *s, loff_t *pos) {
+	if (*pos >= SCULL_NR_DEVS) {
+		return NULL;
+	}
+	return scull_devices + *pos;
+}
+
+static void *scull_seq_next(struct seq_file *s, void *v, loff_t *pos) {
+	(*pos)++;
+	if (*pos >= SCULL_NR_DEVS) {
+		return NULL;
+	}
+	return scull_devices + *pos;
+}
+
+static void scull_seq_stop(struct seq_file *s, void *v) {
+	// Actually, there's nothing to do here
+}
+
+static int scull_seq_show(struct seq_file *s, void *v) {
+	struct scull_dev *dev = (struct scull_dev *) v;
+	struct scull_qset *d;
+	int i;
+
+	seq_printf(s, "\nDevice %i: qset %i, q %i, sz %li\n",
+		(int) (dev - scull_devices), dev->qset,
+		dev->quantum, dev->size);
+	for (d = dev->data; d; d = d->next) { // scan the list
+		seq_printf(s, " item at %p, qset at %p\n", d, d->data);
+		if (d->data && !d->next) {
+			for (i = 0; i < dev->qset; i++) {
+				if (d->data[i]) {
+					seq_printf(s, " % 4i: %8p\n", i, d->data[i]);
+				}
+			}
+		}
+	}
+
+	return 0;
+}
+
+// Tie the sequence operators up
+static struct seq_operations scull_seq_ops = {
+	.start	= scull_seq_start,
+	.next	= scull_seq_next,
+	.stop	= scull_seq_stop,
+	.show	= scull_seq_show
+};
+
+// Now to implement the /proc file we need only make an open
+// method which set up the sequence operators
+static int scull_proc_open(struct inode *inode, struct file *file) {
+	return seq_open(file, &scull_seq_ops);
+}
+
+// Create a set of file operations for our proc file
+static struct file_operations scull_proc_ops = {
+	.owner	= THIS_MODULE,
+	.open	= scull_proc_open,
+	.read	= seq_read,
+	.llseek = seq_lseek,
+	.release = seq_release
+};
+
 // Acutally create (and remove) the /proc file(s)
 static void scull_create_proc(void) {
+	struct proc_dir_entry *entry;
 	create_proc_read_entry("scullmem", 0 /* default mode */,
 				NULL /* parent dir */, scull_read_procmem,
 				NULL /* client data */);
+	entry = create_proc_entry("scullseq", 0, NULL);
+	if (entry) {
+		entry->proc_fops = &scull_proc_ops;
+	}
 }
 
 static void scull_remove_proc(void) {
 	// No problem if it was not registered
 	remove_proc_entry("scullmem", NULL /* Parent dir */);
+	remove_proc_entry("scullseq", NULL);
 }
 
 int scull_init_module(void) {
@@ -303,6 +376,8 @@ fail:
 
 void scull_cleanup_module(void) {
 	dev_t devno = MKDEV(scull_major, scull_minor);
+
+	scull_remove_proc();
 
 	unregister_chrdev_region(devno, SCULL_NR_DEVS);
 
