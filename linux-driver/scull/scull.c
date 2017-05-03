@@ -1,6 +1,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 
+#include <linux/sched.h>
 #include <linux/kernel.h>	/* printk() */
 #include <linux/types.h>
 #include <linux/fs.h>		/* everything...*/
@@ -15,6 +16,7 @@
 MODULE_LICENSE("GPL");
 
 #define SCULL_NR_DEVS 4
+#define SCULL_P_NR_DEVS 4
 /* The bare device is a variable-length region of memory.
  * Use a linked list of indirect blocks.
  *
@@ -25,6 +27,8 @@ MODULE_LICENSE("GPL");
  */
 #define SCULL_QUANTUM 4000
 #define SCULL_QSET 1000
+
+#define SCULL_P_BUFFER 4000
 
 /*
  * Ioctl definitions
@@ -62,12 +66,287 @@ struct scull_dev {
 	struct cdev	cdev;	// Char device structure
 };
 
+struct scull_pipe {
+	wait_queue_head_t inq, outq;	// read and write queues
+	char *buffer, *end;		// begin of buf, end of buf
+	int buffersize;			// used in pointer arithmetic
+	char *rp, *wp;			// where to read, where to write
+	int nreaders, nwriters;		// number of openings for r/w
+	struct semaphore sem;		// mutual exclusion semaphore
+	struct cdev cdev;		// char device structure
+};
+
 struct scull_dev *scull_devices;	// Allocated in scull_init_module
 
 int scull_major = 0;
 int scull_minor = 0;
 int scull_quantum = SCULL_QUANTUM;
 int scull_qset = SCULL_QSET;
+
+int scull_p_nr_devs = SCULL_P_NR_DEVS;	// number of pipe devices
+int scull_p_buffer = SCULL_P_BUFFER;	// buffer size
+dev_t scull_p_devno;
+
+struct scull_pipe *scull_p_devices;
+
+ssize_t scull_p_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+	struct scull_pipe *dev = filp->private_data;
+
+	if (down_interruptible(&dev->sem)) {
+		return -ERESTARTSYS;
+	}
+
+	// The while loop tests the buffer with the device semaphore held.
+	// If there is data there, we know we can return it to the user 
+	// immediately without sleeping, so the entire body of the loop is
+	// skipped.
+	while(dev->rp == dev->wp) { // Nothing to read
+		up(&dev->sem); // Release the lock
+
+		// Return if the user has requested non-blocking I/O
+		if (filp->f_flags & O_NONBLOCK) {
+			return -EAGAIN;
+		}
+
+		// Otherwise go to sleep
+		printk("scullpipe: reading go to sleep");
+
+		// Something has awakened us but we do not know that.
+		// One possibility is that the process received a signal.
+		// The if statement that contains the wait_event_interruptible call
+		// checks for this case.This statement ensures the proper and
+		// expected reaction to signals, which could have been responsible
+		// for waking up the process. If a signal has arrived and it has
+		// not been blocked by the process, the proper behavior is to let
+		// upper layers of the kernel handle that event. To this end, the
+		// driver returns -ERESTARTSYS to the caller; this value is used
+		// internally by the virtual filesystem (VFS) layer, which either
+		// restart the system call or returns -EINTR to user space.
+		if (wait_event_interruptible(dev->inq, (dev->rp != dev->wp)))	{
+			return -ERESTARTSYS;	// signal: tell the fs layer to handle it
+		}
+
+		// However, even in the absence of a signal, we do not yet know
+		// sure that there is data there for the taking. Somebody else
+		// could have been waiting for data as well, and they might
+		// win the race and get the data first. So we must get the
+		// semaphore again; only then can we test the read buffer again
+		// (in the while loop) and truly know that we can return the
+		// data in the buffer to the user.
+		if (down_interruptible(&dev->sem)) {
+			return -ERESTARTSYS;
+		}
+	}
+
+	// We know that the semaphore is held and the buffer contains data
+	// that we can use. We can now read the data
+	if (dev->wp > dev->rp) {
+		count = min(count, (size_t)(dev->wp - dev->rp));
+	} else {
+		// the write point has wrapped, return data up to dev->end
+		count = min(count, (size_t)(dev->end - dev->rp));
+	}
+
+	if (copy_to_user(buf, dev->rp, count)) {
+		up(&dev->sem);
+		return -EFAULT;
+	}
+
+	dev->rp += count;
+	if (dev->rp == dev->end) {
+		// wrapped
+		dev->rp = dev->buffer;
+	}
+
+	up(&dev->sem);
+
+	// finally, awaken any writers and return
+	wake_up_interruptible(&dev->outq);
+	printk("scullpipe: read %li bytes\n", (long)count);
+
+	return count;
+}
+
+// How much space is free
+int spacefree(struct scull_pipe *dev) {
+	if (dev->rp == dev->wp) {
+		return dev->buffersize - 1;
+	}
+	return ((dev->rp + dev->buffersize - dev->wp) % dev->buffersize) - 1;
+}
+
+// Wait for space for writing; caller must hold device semaphore. On
+// error the semaphore will be released before returning
+int scull_getwritespace(struct scull_pipe *dev, struct file *filp) {
+	while(spacefree(dev) == 0) { // full
+		DEFINE_WAIT(wait);
+
+		up(&dev->sem);
+		if (filp->f_flags & O_NONBLOCK) {
+			return -EAGAIN;
+		}
+		printk("writing: going to sleep\n");
+
+		prepare_to_wait(&dev->outq, &wait, TASK_INTERRUPTIBLE);
+		if (spacefree(dev) == 0) {
+			schedule();
+		}
+
+		finish_wait(&dev->outq, &wait);
+
+		// Signal: tell the fs layer to handle it
+		if (signal_pending(current)) {
+			return -ERESTARTSYS;
+		}
+		if (down_interruptible(&dev->sem)) {
+			return -ERESTARTSYS;
+		}
+	}
+
+	return 0;
+}
+
+ssize_t scull_p_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_ops) {
+	struct scull_pipe *dev = filp->private_data;
+	int result;
+
+	if (down_interruptible(&dev->sem)) {
+		return -ERESTARTSYS;
+	}
+
+	// Make sure there's space to write
+	result = scull_getwritespace(dev, filp);
+	if (result) {
+		// scull_getwritespace called up(&dev->sem)
+		return result;
+	}
+
+	// ok, space there, accept something
+	count = min(count, (size_t)spacefree(dev));
+	if (dev->wp >= dev->rp) {
+		count = min(count, (size_t)(dev->end - dev->wp)); // to end-of-buffer
+	} else {
+		// the write pointer has wrapped, fill up to rp-1
+		count = min(count, (size_t)(dev->rp - dev->wp - 1));
+	}
+	printk("scullpipe: accept %li bytes\n", (long)count);
+
+	if (copy_from_user(dev->wp, buf, count)) {
+		up(&dev->sem);
+		return -EFAULT;
+	}
+	dev->wp += count;
+	if (dev->wp == dev->end) {
+		dev->wp = dev->buffer; // wrapped
+	}
+	up(&dev->sem);
+
+	// finally, awake any reader
+	wake_up_interruptible(&dev->inq);	// blocked in read() and select()
+	printk("scullpipe: write %li bytes\n", (long)count);
+
+	return count;
+}
+
+int scull_p_open(struct inode *inode, struct file *filp) {
+	struct scull_pipe *dev;
+
+	dev = container_of(inode->i_cdev, struct scull_pipe, cdev);
+	filp->private_data = dev;
+
+	if (down_interruptible(&dev->sem)) {
+		return -ERESTARTSYS;
+	}
+	if (!dev->buffer) {
+		// allocate the buffer
+		dev->buffer = kmalloc(scull_p_buffer, GFP_KERNEL);
+		if (!dev->buffer) {
+			up(&dev->sem);
+			return -ENOMEM;
+		}
+	}
+	dev->buffersize = scull_p_buffer;
+	dev->end = dev->buffer + dev->buffersize;
+	dev->rp = dev->wp = dev->buffer; // rd and wr from the beginning
+
+	if (filp->f_mode & FMODE_READ) {
+		dev->nreaders++;
+	}
+	if (filp->f_mode & FMODE_WRITE) {
+		dev->nwriters++;
+	}
+	up(&dev->sem);
+
+	printk("scullpipe: open successfully\n");
+
+	return nonseekable_open(inode, filp);
+}
+
+// The file operations for the pipe device
+struct file_operations scull_pipe_fops = {
+	.owner	=	THIS_MODULE,
+	.open	= 	scull_p_open,
+	.read	=	scull_p_read,
+	.write	=	scull_p_write,
+};
+
+// Set up a cdev entry
+void scull_p_setup_cdev(struct scull_pipe *dev, int index) {
+	int err, devno = scull_p_devno + index;
+
+	cdev_init(&dev->cdev, &scull_pipe_fops);
+	dev->cdev.owner = THIS_MODULE;
+	err = cdev_add(&dev->cdev, devno, 1);
+	// Fail gracefully if need be
+	if (err) {
+		printk("Error %d adding scullpipe%d", err, index);
+	}
+}
+
+// Initialize the pipe devs; return how many we did
+int scull_p_init(dev_t firstdev) {
+	int i, result;
+
+	result = register_chrdev_region(firstdev, scull_p_nr_devs, "scullp");
+	if (result < 0) {
+		printk("Unable to get scullp region, error %d\n", result);
+		return 0;
+	}
+	scull_p_devno = firstdev;
+	scull_p_devices = kmalloc(scull_p_nr_devs * sizeof(struct scull_pipe), GFP_KERNEL);
+	if (scull_p_devices == NULL) {
+		unregister_chrdev_region(firstdev, scull_p_nr_devs);
+		return 0;
+	}
+	memset(scull_p_devices, 0, scull_p_nr_devs * sizeof(struct scull_pipe));
+	for (i = 0; i < scull_p_nr_devs; i++) {
+		init_waitqueue_head(&(scull_p_devices[i].inq));
+		init_waitqueue_head(&(scull_p_devices[i].outq));
+		sema_init(&scull_p_devices[i].sem, 1);
+		scull_p_setup_cdev(scull_p_devices + i, i);
+	}
+
+	// create_proc_read_entry("scullpipe", 0, NULL, scull_read_p_mem, NULL);
+	return scull_p_nr_devs;
+}
+
+// This is called by cleanup_module or on failure.
+// It is required to never fail, even if nothing was initialized first
+void scull_p_cleanup(void) {
+	int i;
+
+	if (!scull_p_devices) {
+		return;	// Nothing else to release
+	}
+
+	for (i = 0; i < scull_p_nr_devs; i++) {
+		cdev_del(&scull_p_devices[i].cdev);
+		kfree(scull_p_devices[i].buffer);
+	}
+	kfree(scull_p_devices);
+	unregister_chrdev_region(scull_p_devno, scull_p_nr_devs);
+	scull_p_devices = NULL;
+}
 
 void scull_cleanup_module(void);
 
@@ -463,6 +742,10 @@ int scull_init_module(void) {
 		scull_devices[i].qset = scull_qset;
 		scull_setup_cdev(&scull_devices[i], i);
 	}
+
+	// At this point call the init funciton for any friend device
+	dev = MKDEV(scull_major, scull_minor + SCULL_NR_DEVS);
+	dev += scull_p_init(dev);
 	
 	scull_create_proc();
 
@@ -480,6 +763,9 @@ void scull_cleanup_module(void) {
 	scull_remove_proc();
 
 	unregister_chrdev_region(devno, SCULL_NR_DEVS);
+
+	// call the cleanup functions for friend devices
+	scull_p_cleanup();
 
 	printk("scull: module clean up succeed\n");
 }

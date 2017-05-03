@@ -20,9 +20,11 @@
 
 int main() {
 	int fd, cmd, quantum;
+	int n, flags;
+	char buf[1024];
 
 	if ((fd = open("/dev/scull0", O_WRONLY)) == -1) {
-		perror("open failed");
+		perror("open scull failed");
 		return -1;
 	}
 
@@ -34,7 +36,23 @@ int main() {
 		return -1;
 	}
 	printf("old quantum is %d\n", quantum);
-		
+
+	close(fd);
+
+	if ((fd = open("/dev/scullpipe0", O_RDONLY)) == -1) {
+		perror("open scullpipe failed\n");
+		return -1;
+	}
+
+	flags = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+	while( (n = read(fd, buf, sizeof(buf))) == -1) {
+		perror("read failed");
+		sleep(1);
+	}
+	printf("%s\n", buf);
+
 	return 0;	
 }
 
