@@ -86,18 +86,95 @@ int jit_currentime(char *buf, char **start, off_t offset,
 	return len;
 }
 
+// The timer example follows
+int tdelay = 10;
+
+// This data structure used as "data" for the timer and tasklet functions
+struct jit_data {
+	struct timer_list timer;
+	wait_queue_head_t wait;
+	unsigned long prevjiffies;
+	unsigned char *buf;
+	int loops;
+};
+#define JIT_ASYNC_LOOPS 5
+
+void jit_timer_fn(unsigned long arg) {
+	struct jit_data *data = (struct jit_data *)arg;
+	unsigned long j = jiffies;
+	data->buf += sprintf(data->buf, "%9li  %3li     %i    %6i   %i   %s\n",
+			j, j - data->prevjiffies, in_interrupt() ? 1 : 0,
+			current->pid, smp_processor_id(), current->comm);
+	if (--data->loops) {
+		data->timer.expires += tdelay;
+		data->prevjiffies = j;
+		add_timer(&data->timer);
+	} else {
+		wake_up_interruptible(&data->wait);
+	}
+}
+
+int jit_timer(char *buf, char **start, off_t offset,
+	int len, int *eof, void *unused_data) {
+	struct jit_data *data;
+	char *buf2 = buf;
+	unsigned long j = jiffies;
+
+	data = kmalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+		return -ENOMEM;
+	}
+	init_timer(&data->timer);
+	init_waitqueue_head(&data->wait);
+
+	// Write the first lines in the buffer
+	buf2 += sprintf(buf2, "   time   delta   inirq    pid   cpu command\n");
+	buf2 += sprintf(buf2, "%9li  %3li     %i    %6i   %i   %s\n",
+			j, 0L, in_interrupt() ? 1 : 0,
+			current->pid, smp_processor_id(), current->comm);
+
+	// Fill the data for our timer function
+	data->prevjiffies = j;
+	data->buf = buf2;
+	data->loops = JIT_ASYNC_LOOPS;
+
+	// Register the timer
+	data->timer.data = (unsigned long)data;
+	data->timer.function = jit_timer_fn;
+	data->timer.expires = j + tdelay;
+	add_timer(&data->timer);
+
+	// Wait for the buffer to fill
+	wait_event_interruptible(data->wait, !data->loops);
+	if (signal_pending(current)) {
+		return -ERESTARTSYS;
+	}
+	buf2 = data->buf;
+	kfree(data);
+	*eof = 1;
+
+	return buf2 - buf;
+}
+
 int __init jit_init(void) {
 	create_proc_read_entry("currentime", 0, NULL, jit_currentime, NULL);
 	create_proc_read_entry("jitbusy", 0, NULL, jit_fn, (void *)JIT_BUSY);
 	create_proc_read_entry("jitsched", 0, NULL, jit_fn, (void *)JIT_SCHED);
 	create_proc_read_entry("jitqueue", 0, NULL, jit_fn, (void *)JIT_QUEUE);
 	create_proc_read_entry("jitschedto", 0, NULL, jit_fn, (void *)JIT_SCHEDTO);
+	create_proc_read_entry("jitimer", 0, NULL, jit_timer, NULL);
 
 	return 0;
 }
 
 void __exit jit_cleanup(void) {
 	remove_proc_entry("currentime", NULL);
+	remove_proc_entry("jitbusy", NULL);
+	remove_proc_entry("jitsched", NULL);
+	remove_proc_entry("jitqueue", NULL);
+	remove_proc_entry("jitschedto", NULL);
+
+	remove_proc_entry("jitimer", NULL);
 }
 
 module_init(jit_init);
