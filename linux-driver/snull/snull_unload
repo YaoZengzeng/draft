@@ -1,0 +1,6 @@
+#!/bin/sh
+
+/sbin/ifconfig sn0 down
+/sbin/ifconfig sn1 down
+/sbin/rmmod snull
+
