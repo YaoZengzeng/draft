@@ -38,5 +38,13 @@ func main() {
 
 	fmt.Printf("annotation is %v\n", argAnnotations)
 
+	services, err := getAllServices(server)
+	if err != nil {
+		fmt.Printf("get all service failed: %v\n", err)
+	}
+
+	fmt.Printf("all services are %v\n", services)
+
 	return
 }
+
